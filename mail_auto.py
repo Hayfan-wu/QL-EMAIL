@@ -33,6 +33,12 @@ from typing import Any, Dict, List, Union
 import certifi
 import requests
 
+# 登录API模块（可选，用于 --login 模式）
+try:
+    from login_api import validate_config as _login_validate
+except ImportError:
+    _login_validate = None
+
 # ==================== 环境变量加载 ====================
 _PROJECT_DIR = Path(__file__).resolve().parent
 _ENV_FILE = _PROJECT_DIR / ".env"
@@ -106,6 +112,7 @@ _session.headers.update({
 
 
 def _apply_auth(auth: dict):
+    """将认证信息应用到会话头"""
     m_info = auth.get("m_info", "")
     if not m_info:
         did = str(uuid.uuid4()).upper()
@@ -117,6 +124,7 @@ def _apply_auth(auth: dict):
 
 
 def _build_env(auth: dict) -> dict:
+    """构建请求体中的 env 字段"""
     return {
         "emailList": auth.get("email_list", []),
         "installedApps": ["xhs"],
@@ -176,15 +184,27 @@ def api_get_gift_list() -> dict:
 # ==================== 任务执行 ====================
 
 def sign_tasks(auth: dict, signin_only: bool = False):
+    """执行签到及所有任务"""
     emails = auth.get("email_list", [])
     email_str = ", ".join(emails) if emails else "未知"
     log(f"[任务开始] {mask(email_str[:20])}")
+
     _apply_auth(auth)
+
     result = {
-        "email": email_str, "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "items": [], "login": True, "signin": {}, "tasks_done": 0,
-        "score_before": 0, "score_after": 0, "today_earned": 0, "gifts": [],
+        "email": email_str,
+        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "items": [],
+        "login": True,
+        "signin": {},
+        "tasks_done": 0,
+        "score_before": 0,
+        "score_after": 0,
+        "today_earned": 0,
+        "gifts": [],
     }
+
+    # 认证预检
     score_data = api_get_score()
     if not isinstance(score_data, dict) or score_data.get("code") != 200:
         log(f"[认证失败] 接口返回异常: {score_data}")
@@ -193,10 +213,12 @@ def sign_tasks(auth: dict, signin_only: bool = False):
         _save_result(result)
         return result
     log("[认证] 有效")
+
     score_before = score_data.get("result", {}).get("score", 0)
     result["score_before"] = score_before
     log(f"[积分] 当前: {score_before}")
 
+    # 签到
     if ENABLE_SIGNIN:
         log("[签到] 开始")
         detail = api_get_task_detail("SIGN_IN")
@@ -208,8 +230,10 @@ def sign_tasks(auth: dict, signin_only: bool = False):
             info = detail.get("result", {}).get("detail", {})
             history = info.get("history", [])
             continuous = info.get("continuousDuration", 0)
+
             log(f"[签到] {title} | 状态: {status} | 奖励: {reward}积分")
             log(f"[签到] 连续签到: {continuous}天 | 已签: {history or '无'}")
+
             if status != "Done":
                 spe_type = brief.get("taskSpeType", "")
                 if spe_type:
@@ -223,6 +247,8 @@ def sign_tasks(auth: dict, signin_only: bool = False):
                         msg = r.get("desc", "签到失败")
                         log(f"[签到失败] {msg}")
                         result["signin"] = {"ok": False, "msg": msg}
+                else:
+                    log("[签到] 无 taskSpeType, 可能需要App内操作")
             else:
                 log("[签到] 今日已签到")
                 result["signin"] = {"ok": True, "msg": "今日已签到"}
@@ -232,7 +258,10 @@ def sign_tasks(auth: dict, signin_only: bool = False):
     else:
         log("[签到] 已禁用")
 
-    if not signin_only:
+    if signin_only:
+        log("[仅签到模式] 跳过其他任务")
+    else:
+        # 集赞墙
         log("[集赞墙] 查询")
         cl = api_get_task_detail("COLLECT_LIKE")
         if isinstance(cl, dict) and cl.get("code") == 200:
@@ -245,24 +274,35 @@ def sign_tasks(auth: dict, signin_only: bool = False):
             if status == "Done":
                 result["items"].append({"type": "集赞墙", "value": "已完成"})
 
+        # 各类任务
         if ENABLE_TASKS:
             views = [
-                ("互动任务", "interaction"), ("新用户功能体验", "onboarding"),
-                ("AI功能体验", "ai_onboarding"), ("外贸功能体验", "industry_onboarding"),
-                ("会员功能体验", "member_onboarding"), ("推荐设置", "setting"),
-                ("每日任务", "daily"), ("产品合作", "cooperation"), ("会员任务", "open_member"),
+                ("互动任务", "interaction"),
+                ("新用户功能体验", "onboarding"),
+                ("AI功能体验", "ai_onboarding"),
+                ("外贸功能体验", "industry_onboarding"),
+                ("会员功能体验", "member_onboarding"),
+                ("推荐设置", "setting"),
+                ("每日任务", "daily"),
+                ("产品合作", "cooperation"),
+                ("会员任务", "open_member"),
             ]
+
             total_claimed = 0
             for label, key in views:
                 tasks_res = api_get_task_list(auth, view_types=[key])
                 if not isinstance(tasks_res, dict) or tasks_res.get("code") != 200:
+                    log(f"[{label}] 无任务")
                     continue
+
                 tasks = tasks_res.get("result", {}).get("list", [])
                 if not tasks:
                     continue
+
                 ext = tasks_res.get("result", {}).get("taskExtendInfo", {})
                 residual = ext.get("todayResidualScore", "?")
                 log(f"[{label}] 剩余可获积分: {residual}, 任务数: {len(tasks)}")
+
                 for task in tasks:
                     status = task.get("status", "")
                     title = task.get("title", {}).get("cn", "未知")
@@ -270,6 +310,7 @@ def sign_tasks(auth: dict, signin_only: bool = False):
                     pts = task.get("reward", {}).get("value", "?")
                     button = task.get("button", {})
                     op = button.get("operation", {}).get("route", {}).get("type", "")
+
                     if status == "Init" and op == "claim":
                         log(f"[{label}] 领取: {title} ({pts}分)")
                         r = api_claim_task(spe)
@@ -291,9 +332,17 @@ def sign_tasks(auth: dict, signin_only: bool = False):
                         else:
                             log(f"[{label}]   -> 失败: {r.get('desc', r)}")
                         time.sleep(0.5)
+                    elif status == "Done":
+                        pass
+                    elif status == "Todo":
+                        log(f"[{label}] 需App操作: {title}")
+
             result["tasks_done"] = total_claimed
             log(f"[任务] 共完成 {total_claimed} 个任务")
+        else:
+            log("[任务] 已禁用")
 
+        # 广告
         if ENABLE_AD:
             log("[广告] 开始 (最多3次)")
             ad_res = api_get_task_list(auth, entry="TaskCenter", limit=1)
@@ -306,7 +355,7 @@ def sign_tasks(auth: dict, signin_only: bool = False):
                             log(f"[广告] 第{i+1}/3次")
                             r = api_claim_task("reward_ad#1")
                             if r.get("code") == 200:
-                                log("[广告]   -> 成功")
+                                log(f"[广告]   -> 成功")
                                 result["items"].append({"type": "广告", "value": f"第{i+1}次"})
                             else:
                                 log(f"[广告]   -> 失败: {r.get('desc', r)}")
@@ -314,18 +363,26 @@ def sign_tasks(auth: dict, signin_only: bool = False):
                         break
             if not ad_found:
                 log("[广告] 未找到广告任务")
+        else:
+            log("[广告] 已禁用")
 
+        # 礼品
         gifts = api_get_gift_list()
         if isinstance(gifts, dict) and gifts.get("code") == 200:
             for g in gifts.get("result", [])[:5]:
-                result["gifts"].append({"name": g.get("name", {}).get("cn", ""), "score": g.get("score", 0)})
+                name = g.get("name", {}).get("cn", "")
+                score = g.get("score", 0)
+                result["gifts"].append({"name": name, "score": score})
+            log(f"[礼品] 已查询")
 
+    # 最终积分
     final = api_get_score()
     if isinstance(final, dict) and final.get("code") == 200:
         score_after = final.get("result", {}).get("score", 0)
         result["score_after"] = score_after
         result["today_earned"] = score_after - score_before
         log(f"[积分] {score_before} -> {score_after} (本次+{result['today_earned']})")
+
     log(f"[任务全部完成] {mask(email_str[:20])}")
     _save_result(result)
     return result
@@ -355,11 +412,13 @@ def _save_result(run_result: dict):
 
 
 def format_wxpusher_summary(result: dict) -> str:
+    email = result.get("email", "未知")
     signin = result.get("signin", {})
     score_before = result.get("score_before", 0)
     score_after = result.get("score_after", 0)
     today = result.get("today_earned", 0)
     tasks_done = result.get("tasks_done", 0)
+
     lines = [
         f"邮箱大师签到 {'✅' if signin.get('ok') else '❌'}",
         f"积分 {score_before} -> {score_after} (本次+{today})",
@@ -375,26 +434,32 @@ def query_results() -> str:
     history = records.get("history", [])
     if not history:
         return "暂无任务执行记录，请先执行 大师执行"
-    return format_wxpusher_summary(history[-1])
+    last = history[-1]
+    return format_wxpusher_summary(last)
 
 
 # ==================== 账号解析 ====================
 
 def _parse_cookie(cookie_str: str) -> list:
+    """解析 MASTER_COOKIE: mastersess:::masterfp:::M_INFO:::token1&token2:::email1&email2"""
     if not cookie_str:
         return []
     parts = cookie_str.strip().split(":::")
     if len(parts) < 5:
         return []
+    token_list = [t.strip() for t in parts[3].split("&") if t.strip()]
+    email_list = [e.strip() for e in parts[4].split("&") if e.strip()]
     return [{
-        "mastersess": parts[0].strip(), "masterfp": parts[1].strip(),
+        "mastersess": parts[0].strip(),
+        "masterfp": parts[1].strip(),
         "m_info": parts[2].strip(),
-        "token_list": [t.strip() for t in parts[3].split("&") if t.strip()],
-        "email_list": [e.strip() for e in parts[4].split("&") if e.strip()],
+        "token_list": token_list,
+        "email_list": email_list,
     }]
 
 
 def _parse_individual() -> list:
+    """从独立环境变量解析"""
     mastersess = os.environ.get("MASTER_MASTERSESS", "").strip()
     masterfp = os.environ.get("MASTER_MASTERFP", "").strip()
     m_info = os.environ.get("MASTER_M_INFO", "").strip()
@@ -402,8 +467,13 @@ def _parse_individual() -> list:
     emails = [e.strip() for e in os.environ.get("MASTER_EMAILS", "").split("&") if e.strip()]
     if not mastersess or not masterfp or not tokens or not emails:
         return []
-    return [{"mastersess": mastersess, "masterfp": masterfp, "m_info": m_info,
-            "token_list": tokens, "email_list": emails}]
+    return [{
+        "mastersess": mastersess,
+        "masterfp": masterfp,
+        "m_info": m_info,
+        "token_list": tokens,
+        "email_list": emails,
+    }]
 
 
 # ==================== 主入口 ====================
@@ -411,6 +481,8 @@ def _parse_individual() -> list:
 def run_all(signin_only: bool = False) -> dict:
     global _global_logs
     _global_logs = []
+
+    # 解析账号 (支持多账号换行)
     raw = os.environ.get('MASTER_COOKIE', '')
     accounts = []
     for line in raw.strip().split('\n'):
@@ -419,17 +491,23 @@ def run_all(signin_only: bool = False) -> dict:
             parsed = _parse_cookie(line)
             if parsed:
                 accounts.extend(parsed)
+
     if not accounts:
         accounts = _parse_individual()
+
     if not accounts:
         log("未找到环境变量 MASTER_COOKIE，请按格式设置：mastersess:::masterfp:::M_INFO:::token1&token2:::email1&email2")
+        log("多账号换行分隔")
         return {"error": "账号未配置", "login": False}
+
     all_results = []
     for idx, auth in enumerate(accounts, 1):
         emails = auth.get("email_list", [])
         m = mask(emails[0] if emails else "未知")
         log(f"\n{'='*10} 账号[{idx}] {m} {'='*10}")
+
         if signin_only:
+            # 仅签到模式
             _apply_auth(auth)
             detail = api_get_task_detail("SIGN_IN")
             if isinstance(detail, dict) and detail.get("code") == 200:
@@ -449,15 +527,20 @@ def run_all(signin_only: bool = False) -> dict:
         else:
             result = sign_tasks(auth, signin_only=False)
             all_results.append(result)
+
         time.sleep(2)
+
+    # 推送
     try:
         import notify
         if all_results:
             for r in all_results:
-                notify.send('邮箱大师签到推送', format_wxpusher_summary(r))
+                summary = format_wxpusher_summary(r)
+                notify.send('邮箱大师签到推送', summary)
             log("通知推送成功")
     except ImportError:
         pass
+
     return all_results[0] if all_results else {"error": "无执行结果", "login": False}
 
 
@@ -465,7 +548,57 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="QL-EMAIL 网易邮箱大师自动签到")
     parser.add_argument("--signin-only", action="store_true", help="仅执行签到")
+    parser.add_argument("--login", action="store_true", help="手机号+验证码登录（交互式）")
+    parser.add_argument("--validate", action="store_true", help="验证 MASTER_COOKIE 是否有效")
     args = parser.parse_args()
+
+    if args.login:
+        # 交互式登录
+        try:
+            from login_api import send_sms_code, full_login
+        except ImportError:
+            print("[FAIL] login_api.py 未找到，请确保文件存在")
+            sys.exit(1)
+
+        phone = input("请输入手机号: ").strip()
+        if not phone:
+            print("[FAIL] 手机号不能为空")
+            sys.exit(1)
+
+        result = send_sms_code(phone)
+        if not result.get("ok"):
+            print(f"[FAIL] 发送验证码失败: {result.get('msg')}")
+            sys.exit(1)
+
+        print(f"验证码已发送到 {phone}")
+        code = input("请输入验证码: ").strip()
+        if not code:
+            print("[FAIL] 验证码不能为空")
+            sys.exit(1)
+
+        login_result = full_login(phone, code)
+        if login_result.get("ok"):
+            print(f"\n[OK] 登录成功!")
+            print(f"MASTER_COOKIE={login_result.get('master_cookie', '')}")
+            print(f"邮箱: {login_result.get('emails', [])}")
+            print(f"\n请将以上 MASTER_COOKIE 设置到环境变量中")
+        else:
+            print(f"\n[FAIL] {login_result.get('msg', '')}")
+        sys.exit(0)
+
+    if args.validate:
+        cookie = os.environ.get('MASTER_COOKIE', '')
+        if not cookie:
+            print("[FAIL] MASTER_COOKIE 未设置")
+            sys.exit(1)
+
+        if _login_validate:
+            valid = _login_validate(cookie)
+            print(f"[{'OK' if valid else 'FAIL'}] 配置{'有效' if valid else '无效'}")
+        else:
+            print("[FAIL] login_api.py 未找到")
+        sys.exit(0)
+
     result = run_all(signin_only=args.signin_only)
     if result.get("error"):
         print(f"\n[FAIL] {result['error']}")

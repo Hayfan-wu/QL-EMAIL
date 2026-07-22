@@ -1,0 +1,5 @@
+.env
+result.json
+mail_master.log
+__pycache__/
+*.pyc
